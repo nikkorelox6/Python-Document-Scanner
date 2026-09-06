@@ -38,12 +38,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 
-try:
-    from scipy.interpolate import PchipInterpolator as _PchipInterpolator
-    _HAVE_SCIPY_INTERPOLATION = True
-except Exception:  # pragma: no cover - optional non-linear dewarp refinement
-    _HAVE_SCIPY_INTERPOLATION = False
-
 import cv2
 import numpy as np
 
@@ -70,9 +64,7 @@ MIN_DOCUMENT_AREA_RATIO = 0.10  # a candidate must cover >=10% of the frame
 MAX_DOCUMENT_AREA_RATIO = 0.95  # candidates covering nearly the whole frame are
                                   # almost always an inverted-background artifact
 FLATNESS_DEVIATION_RATIO = 0.006  # edge deviation / page-size => "curved" page
-MAX_EDGE_SAMPLE_POINTS = 48  # boundary samples retained for spline/mesh dewarping
-DEWARP_GRID_X = 48  # horizontal mesh cells
-DEWARP_GRID_Y = 48  # vertical mesh cells
+MAX_EDGE_SAMPLE_POINTS = 24  # points sampled per edge for the TPS solve
 AMBIGUITY_SCORE_MARGIN = 0.10
 GRABCUT_BORDER_RATIO = 0.025  # outer band seeded as definite background
 GRABCUT_MIN_ITERATIONS = 5
@@ -328,31 +320,14 @@ class DocumentLocalizer:
 
         is_flat = True
         edge_points_full: dict = {}
-
-        # Derive curvature samples from the actual outer contour rather than
-        # from arbitrary high-gradient features inside the document. Edge maps
-        # (Canny) are already used during candidate generation; here we use the
-        # resulting page contour so the spline stage cannot accidentally lock
-        # onto text strokes, dimension lines, or background texture.
-        curvature_contour = self._extract_curvature_contour(small, best["corners"])
-        if curvature_contour is None:
-            candidate_contour = best.get("contour")
-            curvature_contour = (
-                np.asarray(candidate_contour, dtype=np.float32).reshape(-1, 2)
-                if candidate_contour is not None else None
-            )
-        if curvature_contour is not None:
-            refined_small_edges = self._extract_edge_points_from_contour(
-                curvature_contour, best["corners"]
-            )
-            if self._edge_points_usable(refined_small_edges):
-                edge_points_full = {
-                    k: np.asarray(v, dtype=np.float32) * inv_scale
-                    for k, v in refined_small_edges.items()
-                }
-                is_flat = self._estimate_flatness_from_edges(
-                    best["corners"], refined_small_edges
-                )
+        if (
+            not best["used_fallback_shape"]
+            and hasattr(cv2, "createThinPlateSplineShapeTransformer")
+        ):
+            curvature_contour = self._extract_curvature_contour(small, best["corners"])
+            if curvature_contour is not None:
+                contour_full = curvature_contour.astype(np.float32) * inv_scale
+                is_flat, edge_points_full = self._estimate_flatness(corners_full, contour_full)
 
         confidence = float(np.clip(best["score"], 0.0, 1.0))
         if confidence < self.config.min_confidence:
@@ -628,86 +603,6 @@ class DocumentLocalizer:
         return inter / union if union else 0.0
 
     @staticmethod
-    def _edge_points_usable(edge_points: dict) -> bool:
-        """Return True only when every page side has good contour coverage."""
-        if not edge_points:
-            return False
-        return all(
-            name in edge_points and len(np.asarray(edge_points[name])) >= 8
-            for name in ("top", "right", "bottom", "left")
-        )
-
-    @staticmethod
-    def _extract_edge_points_from_contour(contour: np.ndarray, quad_corners: np.ndarray) -> dict:
-        """Partition an outer page contour into four ordered edge point sets.
-
-        Each contour point is assigned to an edge by its projection onto the
-        corresponding corner-to-corner segment. A generous normal band permits
-        bowed/curled edges to remain represented, while the requirement that
-        each side spans most of its expected length rejects partial or unrelated
-        contours.
-        """
-        pts = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
-        if len(pts) < 16:
-            return {}
-        corners = order_points(quad_corners)
-        side_lengths = [
-            float(np.linalg.norm(corners[(i + 1) % 4] - corners[i]))
-            for i in range(4)
-        ]
-        page_scale = max(min(side_lengths), 1.0)
-        band = max(6.0, 0.10 * page_scale)
-        result: dict = {}
-
-        for i, name in enumerate(("top", "right", "bottom", "left")):
-            p0 = corners[i]
-            p1 = corners[(i + 1) % 4]
-            d = p1 - p0
-            d2 = float(np.dot(d, d))
-            if d2 <= 1e-6:
-                return {}
-            t = ((pts - p0) @ d) / d2
-            projected = p0 + t[:, None] * d
-            distance = np.linalg.norm(pts - projected, axis=1)
-            keep = (t >= -0.02) & (t <= 1.02) & (distance <= band)
-            if int(np.count_nonzero(keep)) < 8:
-                return {}
-
-            selected_t = t[keep]
-            coverage = float(selected_t.max() - selected_t.min())
-            if coverage < 0.65:
-                return {}
-
-            selected = pts[keep]
-            selected = selected[np.argsort(selected_t)]
-            # Keep endpoint ownership deterministic. The spline fitting stage
-            # will pin these to the exact detected corners.
-            result[name] = DocumentLocalizer._resample_polyline(selected, MAX_EDGE_SAMPLE_POINTS)
-
-        return result
-
-    @staticmethod
-    def _estimate_flatness_from_edges(corners: np.ndarray, edge_points: dict) -> bool:
-        """Estimate curvature by measuring edge deviation from its chord."""
-        corners = order_points(corners)
-        lengths = [
-            float(np.linalg.norm(corners[(i + 1) % 4] - corners[i]))
-            for i in range(4)
-        ]
-        page_scale = max(float(np.mean(lengths)), 1.0)
-        worst_ratio = 0.0
-        for i, name in enumerate(("top", "right", "bottom", "left")):
-            pts = np.asarray(edge_points.get(name, []), dtype=np.float32).reshape(-1, 2)
-            if len(pts) < 3:
-                continue
-            deviation = DocumentLocalizer._point_to_segment_distances(
-                pts, corners[i], corners[(i + 1) % 4]
-            )
-            if len(deviation):
-                worst_ratio = max(worst_ratio, float(np.max(deviation)) / page_scale)
-        return worst_ratio <= FLATNESS_DEVIATION_RATIO
-
-    @staticmethod
     def _extract_curvature_contour(small: np.ndarray, quad_corners: np.ndarray) -> Optional[np.ndarray]:
         """Independently re-derive a high-fidelity boundary for curvature analysis.
 
@@ -848,59 +743,48 @@ class DocumentLocalizer:
 
 
 class GeometricReconstructor:
-    """Flatten a perspective-distorted and gently curved document.
+    """Flattens the document: a 4-point perspective transform, plus an
+    optional thin-plate-spline (TPS) correction for residual curvature
+    (curled edges, folds, mild book-gutter bulge) detected in Stage 1.
 
-    A flat page is reconstructed with an ordinary four-point homography.
-    When Stage 1 reports meaningful edge curvature, this stage instead builds
-    a *non-linear document coordinate map* from four fitted cubic splines:
-
-      1. each detected page edge is parameterised by normalized arc length;
-      2. opposite edges are sampled at identical parameter values;
-      3. a Coons-style surface interpolates those four curved boundaries into
-         a dense source-coordinate mesh;
-      4. the corresponding destination mesh is a uniform rectangle, so the
-         curved source quadrilaterals are mapped to regular rectangular cells;
-      5. ``cv2.remap`` performs the final inverse spatial warp.
-
-    This is a mesh-warp formulation of non-linear dewarping. It avoids the
-    optional OpenCV TPS shape-transformer API, which is not present in many
-    standard OpenCV Python wheels, while still producing a genuinely
-    non-rigid warp.
+    A plain homography is used whenever the page was judged flat -- "if the
+    page is already flat, unnecessary transformations should be avoided".
     """
 
+    #: Minimum number of boundary correspondence points required before a
+    #: TPS solve is attempted; below this the fit would be unreliable.
+    MIN_TPS_POINTS = 8
     MARGIN_EXPANSION_FRACTION = 0.012
-    MIN_SPLINE_POINTS = 4
 
     def __init__(self, config: ScannerConfig) -> None:
         self.config = config
 
     def reconstruct(self, image: np.ndarray, detection: DocumentDetection) -> tuple[np.ndarray, bool]:
-        """Return ``(flattened_image, applied_nonrigid_dewarp)``.
-
-        Perspective is corrected first. If boundary samples are available,
-        they are transformed into that perspective-corrected coordinate system,
-        where a spline/mesh warp removes the *residual non-linear curvature*.
-        Thus a genuinely flat page is essentially left alone by the mesh stage,
-        while a bowed/curled page is pulled onto a rectangular document grid.
-        """
+        """Return ``(flattened_image, applied_nonrigid_dewarp)``."""
         corners = order_points(detection.corners)
         expanded = order_points(expand_quad(corners, image.shape, self.MARGIN_EXPANSION_FRACTION))
 
-        flattened, homography, out_w, out_h = self._perspective_reconstruct(image, expanded)
+        out_w, out_h = self._output_size(expanded)
+        dst = np.array(
+            [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype=np.float32
+        )
+        homography = cv2.getPerspectiveTransform(expanded, dst)
+        flattened = cv2.warpPerspective(
+            image,
+            homography,
+            (out_w, out_h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
 
-        if not self.config.force_homography and self._edge_data_is_usable(detection.edge_points):
-            dewarped = self._mesh_dewarp(
-                flattened=flattened,
-                edge_points=detection.edge_points,
-                homography=homography,
-                out_w=out_w,
-                out_h=out_h,
-            )
-            if dewarped is not None:
-                return dewarped, True
-            LOGGER.warning("Non-linear mesh dewarping could not be constructed; using perspective-only reconstruction.")
+        skip_dewarp = detection.is_flat or self.config.force_homography or not detection.edge_points
+        if skip_dewarp:
+            return flattened, False
 
-        return flattened, False
+        dewarped = self._nonrigid_dewarp(flattened, detection.edge_points, homography, out_w, out_h)
+        if dewarped is None:
+            return flattened, False
+        return dewarped, True
 
     @staticmethod
     def _output_size(corners: np.ndarray) -> tuple[int, int]:
@@ -909,152 +793,7 @@ class GeometricReconstructor:
         height = max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
         return max(int(round(width)), 16), max(int(round(height)), 16)
 
-    @classmethod
-    def _perspective_reconstruct(cls, image: np.ndarray, corners: np.ndarray) -> tuple[np.ndarray, np.ndarray, int, int]:
-        out_w, out_h = cls._output_size(corners)
-        dst = np.array(
-            [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype=np.float32
-        )
-        homography = cv2.getPerspectiveTransform(corners, dst)
-        flattened = cv2.warpPerspective(
-            image,
-            homography,
-            (out_w, out_h),
-            flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
-        return flattened, homography, out_w, out_h
-
-    @classmethod
-    def _edge_data_is_usable(cls, edge_points: dict) -> bool:
-        if not edge_points:
-            return False
-        names = ("top", "right", "bottom", "left")
-        return all(name in edge_points and len(np.asarray(edge_points[name])) >= cls.MIN_SPLINE_POINTS for name in names)
-
-    @staticmethod
-    def _transform_edge_points(edge_points: dict, homography: np.ndarray) -> dict:
-        """Transform all detected edge points into the perspective-corrected frame."""
-        transformed: dict = {}
-        for name, points in edge_points.items():
-            pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
-            if len(pts) < 2:
-                transformed[name] = pts.reshape(-1, 2)
-                continue
-            transformed[name] = cv2.perspectiveTransform(pts, homography).reshape(-1, 2).astype(np.float32)
-        return transformed
-
-    @staticmethod
-    def _fit_edge_spline(points: np.ndarray, start: np.ndarray, end: np.ndarray, n: int) -> np.ndarray:
-        """Fit a shape-preserving cubic spline and sample it by normalized arc length."""
-        pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-        if len(pts) < 2:
-            return np.linspace(start, end, n, dtype=np.float32)
-
-        # Remove consecutive duplicates; they make spline parameterisation singular.
-        deltas = np.linalg.norm(np.diff(pts, axis=0), axis=1)
-        keep = np.r_[True, deltas > 1e-3]
-        pts = pts[keep]
-
-        # Make sure the contour runs in the intended corner-to-corner direction.
-        start_d = np.linalg.norm(pts[0] - start)
-        start_d_end = np.linalg.norm(pts[-1] - start)
-        if start_d_end < start_d:
-            pts = pts[::-1]
-
-        # Endpoints are pinned exactly to the desired corners.
-        pts[0] = np.asarray(start, dtype=np.float32)
-        pts[-1] = np.asarray(end, dtype=np.float32)
-
-        if len(pts) < 4 or not _HAVE_SCIPY_INTERPOLATION:
-            t = np.linspace(0.0, 1.0, len(pts), dtype=np.float32)
-            tq = np.linspace(0.0, 1.0, n, dtype=np.float32)
-            x = np.interp(tq, t, pts[:, 0])
-            y = np.interp(tq, t, pts[:, 1])
-            return np.column_stack([x, y]).astype(np.float32)
-
-        # Normalized physical arc length makes point correspondence meaningful.
-        arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(pts.astype(np.float64), axis=0), axis=1))]
-        total = float(arc[-1])
-        if total <= 1e-6:
-            return np.linspace(start, end, n, dtype=np.float32)
-        t = (arc / total).astype(np.float64)
-        tq = np.linspace(0.0, 1.0, n, dtype=np.float64)
-
-        try:
-            sx = _PchipInterpolator(t, pts[:, 0].astype(np.float64))(tq)
-            sy = _PchipInterpolator(t, pts[:, 1].astype(np.float64))(tq)
-            sampled = np.column_stack([sx, sy]).astype(np.float32)
-        except Exception:
-            x = np.interp(tq, t, pts[:, 0])
-            y = np.interp(tq, t, pts[:, 1])
-            sampled = np.column_stack([x, y]).astype(np.float32)
-
-        sampled[0] = np.asarray(start, dtype=np.float32)
-        sampled[-1] = np.asarray(end, dtype=np.float32)
-        return sampled
-
-    @staticmethod
-    def _coons_patch(top: np.ndarray, right: np.ndarray, bottom: np.ndarray, left: np.ndarray,
-                     nu: int, nv: int) -> np.ndarray:
-        """Build a source-coordinate Coons patch from four compatible edge splines.
-
-        ``top``/``bottom`` each contain ``nu`` points and ``left``/``right`` each
-        contain ``nv`` points. The result has shape ``(nv, nu, 2)``.
-        """
-        u = np.linspace(0.0, 1.0, nu, dtype=np.float32)[None, :, None]
-        v = np.linspace(0.0, 1.0, nv, dtype=np.float32)[:, None, None]
-
-        top2 = top[None, :, :]
-        bottom2 = bottom[None, :, :]
-        left2 = left[:, None, :]
-        right2 = right[:, None, :]
-
-        c00 = top[0]
-        c10 = top[-1]
-        c01 = bottom[0]
-        c11 = bottom[-1]
-        bilinear = (
-            (1.0 - u) * (1.0 - v) * c00
-            + u * (1.0 - v) * c10
-            + (1.0 - u) * v * c01
-            + u * v * c11
-        )
-        return ((1.0 - v) * top2 + v * bottom2 + (1.0 - u) * left2 + u * right2 - bilinear).astype(np.float32)
-
-    @staticmethod
-    def _mesh_remap_from_nodes(source_nodes: np.ndarray, out_w: int, out_h: int) -> tuple[np.ndarray, np.ndarray]:
-        """Convert source mesh nodes into dense destination->source remap fields."""
-        nv, nu, _ = source_nodes.shape
-        if nu < 2 or nv < 2:
-            raise ValueError("Mesh must contain at least two nodes in each direction")
-
-        gx = np.linspace(0.0, nu - 1.0, out_w, dtype=np.float32)
-        gy = np.linspace(0.0, nv - 1.0, out_h, dtype=np.float32)
-        ix = np.minimum(np.floor(gx).astype(np.int32), nu - 2)
-        iy = np.minimum(np.floor(gy).astype(np.int32), nv - 2)
-        tx = gx - ix
-        ty = gy - iy
-
-        map_x = np.empty((out_h, out_w), dtype=np.float32)
-        map_y = np.empty((out_h, out_w), dtype=np.float32)
-
-        for row in range(out_h):
-            j = int(iy[row])
-            fy = float(ty[row])
-            p00 = source_nodes[j, ix]
-            p10 = source_nodes[j, ix + 1]
-            p01 = source_nodes[j + 1, ix]
-            p11 = source_nodes[j + 1, ix + 1]
-            top = p00 + (p10 - p00) * tx[:, None]
-            bottom = p01 + (p11 - p01) * tx[:, None]
-            p = top + (bottom - top) * fy
-            map_x[row] = p[:, 0]
-            map_y[row] = p[:, 1]
-
-        return map_x, map_y
-
-    def _mesh_dewarp(
+    def _nonrigid_dewarp(
         self,
         flattened: np.ndarray,
         edge_points: dict,
@@ -1062,54 +801,112 @@ class GeometricReconstructor:
         out_w: int,
         out_h: int,
     ) -> Optional[np.ndarray]:
-        """Flatten residual page curvature with a spline-driven quadrilateral mesh.
+        """Correct residual boundary curvature with a thin-plate spline.
 
-        The page has already undergone perspective correction. The detected
-        boundary samples are transformed into this flat coordinate system, fit
-        with four splines, and sampled into matched top/bottom and left/right
-        point sets. The four splines then define a curvilinear source mesh, while
-        the destination mesh is a uniform rectangle. ``cv2.remap`` maps every
-        destination pixel through that mesh.
+        For each raw boundary point detected in Stage 1, we know (a) where
+        it actually lands in the flattened image (by pushing it through the
+        same homography) and (b) where it *should* land if the page edge
+        were perfectly straight (its perpendicular projection onto the
+        corresponding rectangle side). Feeding those correspondences to a
+        TPS solver yields a smooth warp that pulls curled/folded edges
+        straight while leaving already-straight regions essentially
+        untouched.
         """
-        transformed = self._transform_edge_points(edge_points, homography)
-        tl = np.array([0.0, 0.0], dtype=np.float32)
-        tr = np.array([out_w - 1.0, 0.0], dtype=np.float32)
-        br = np.array([out_w - 1.0, out_h - 1.0], dtype=np.float32)
-        bl = np.array([0.0, out_h - 1.0], dtype=np.float32)
+        ideal_points: list[list[float]] = []
+        actual_points: list[list[float]] = []
 
-        nu = DEWARP_GRID_X + 1
-        nv = DEWARP_GRID_Y + 1
-        top = self._fit_edge_spline(transformed["top"], tl, tr, nu)
-        right = self._fit_edge_spline(transformed["right"], tr, br, nv)
-        bottom = self._fit_edge_spline(transformed["bottom"], br, bl, nu)
-        left = self._fit_edge_spline(transformed["left"], bl, tl, nv)
+        for name, pts in edge_points.items():
+            if pts is None or len(pts) == 0:
+                continue
+            pts_h = np.asarray(pts, dtype=np.float32).reshape(-1, 1, 2)
+            warped_pts = cv2.perspectiveTransform(pts_h, homography).reshape(-1, 2)
+            for x, y in warped_pts:
+                if name == "top":
+                    ideal = (float(x), 0.0)
+                elif name == "bottom":
+                    ideal = (float(x), float(out_h - 1))
+                elif name == "left":
+                    ideal = (0.0, float(y))
+                elif name == "right":
+                    ideal = (float(out_w - 1), float(y))
+                else:  # pragma: no cover - defensive, unknown edge name
+                    continue
+                actual_points.append([float(x), float(y)])
+                ideal_points.append(list(ideal))
 
-        # Explicitly enforce common corners so independent splines cannot fight.
-        top[0], top[-1] = tl, tr
-        right[0], right[-1] = tr, br
-        bottom[0], bottom[-1] = br, bl
-        left[0], left[-1] = bl, tl
+        if len(ideal_points) < self.MIN_TPS_POINTS:
+            LOGGER.debug("Too few boundary correspondences for TPS dewarping; skipping.")
+            return None
 
-        source_nodes = self._coons_patch(top, right, bottom, left, nu, nv)
-        map_x, map_y = self._mesh_remap_from_nodes(source_nodes, out_w, out_h)
+        # Adjacent edges each independently estimate the shared corner
+        # between them, producing near-duplicate points with slightly
+        # different coordinates. Thin-plate splines are ill-conditioned
+        # when given several near-coincident, mutually inconsistent
+        # constraints, which otherwise shows up as large-scale "fisheye"
+        # ringing far from the actual curvature. Clustering and averaging
+        # those near-duplicates keeps the correction localized.
+        ideal_points, actual_points = self._merge_nearby_points(
+            ideal_points, actual_points, radius=max(10.0, 0.015 * min(out_w, out_h))
+        )
+        if len(ideal_points) < self.MIN_TPS_POINTS:
+            return None
 
-        # The mesh lives in the already-warped image, so valid coordinates are
-        # simply the flattened image bounds.
-        fh, fw = flattened.shape[:2]
-        map_x = np.clip(map_x, 0, fw - 1)
-        map_y = np.clip(map_y, 0, fh - 1)
+        matches = [cv2.DMatch(i, i, 0) for i in range(len(ideal_points))]
+        transforming_shape = np.array(ideal_points, dtype=np.float32).reshape(1, -1, 2)
+        target_shape = np.array(actual_points, dtype=np.float32).reshape(1, -1, 2)
+
+        if not hasattr(cv2, "createThinPlateSplineShapeTransformer"):
+            LOGGER.debug(
+                "OpenCV TPS shape transformer is unavailable; using perspective-only reconstruction."
+            )
+            return None
 
         try:
-            return cv2.remap(
+            tps = cv2.createThinPlateSplineShapeTransformer()
+            # A small amount of regularization trades exact interpolation of
+            # (possibly slightly noisy) boundary detections for a smoother,
+            # numerically stable warp -- appropriate since we want the
+            # *general* curvature corrected, not to chase pixel-level noise.
+            tps.setRegularizationParameter(0.5)
+            tps.estimateTransformation(transforming_shape, target_shape, matches)
+            result = tps.warpImage(
                 flattened,
-                map_x,
-                map_y,
-                interpolation=cv2.INTER_CUBIC,
-                borderMode=cv2.BORDER_REPLICATE,
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(255, 255, 255),
             )
         except cv2.error as exc:
-            LOGGER.warning("Mesh remapping failed: %s", exc)
+            LOGGER.warning("Non-rigid dewarping failed (%s); using the perspective-only result.", exc)
             return None
+        return result
+
+    @staticmethod
+    def _merge_nearby_points(
+        ideal_points: list[list[float]], actual_points: list[list[float]], radius: float
+    ) -> tuple[list[list[float]], list[list[float]]]:
+        """Cluster points whose *actual* positions are within ``radius`` px.
+
+        Each cluster collapses to a single (ideal, actual) pair using the
+        cluster's mean, which is what keeps shared corners from adjacent
+        edges from fighting each other in the TPS solve.
+        """
+        actual_arr = np.asarray(actual_points, dtype=np.float32)
+        ideal_arr = np.asarray(ideal_points, dtype=np.float32)
+        n = len(actual_arr)
+        used = np.zeros(n, dtype=bool)
+        merged_ideal: list[list[float]] = []
+        merged_actual: list[list[float]] = []
+
+        for i in range(n):
+            if used[i]:
+                continue
+            dists = np.linalg.norm(actual_arr - actual_arr[i], axis=1)
+            cluster = np.where((dists < radius) & (~used))[0]
+            used[cluster] = True
+            merged_ideal.append(ideal_arr[cluster].mean(axis=0).tolist())
+            merged_actual.append(actual_arr[cluster].mean(axis=0).tolist())
+
+        return merged_ideal, merged_actual
 
 
 # --------------------------------------------------------------------------
